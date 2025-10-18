@@ -1,0 +1,348 @@
+local AIHandler = {}
+AIHandler.__index = AIHandler
+
+-- Services
+local PathfindingService = game:GetService("PathfindingService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+
+local RagdollModule = require(game:GetService("ServerScriptService"):WaitForChild("Modules").EasyRagdoll)
+
+-- Config
+local PATH_UPDATE_INTERVAL = 0.03
+local DEFAULT_WALKSPEED = 19
+local STUCK_TIMEOUT = 0.5
+local OBSTACLE_CHECK_INTERVAL = 0.15
+local JUMP_HEIGHT_LIMIT = 2
+local DEFAULT_MIN_JUMP_HEIGHT = 1
+local WANDER_RADIUS = 180
+local GAP_CHECK_DISTANCE = 6
+local GAP_FALL_DEPTH = 20
+
+local ATTACK_COOLDOWN = 1.8
+local ATTACK_DAMAGE = 20
+local DETECTION_RADIUS = 150
+local ATTACK_RANGE = 5
+
+-- Utility: get distance between two Vector3 positions
+local function getDistance(a, b)
+	return (a.Position - b.Position).Magnitude
+end
+
+-- Creates a new AI handler for the given NPC model
+function AIHandler.new(model)
+	if not model or not model:IsA("Model") then
+		warn("[AIHandler] Invalid model passed.")
+		return nil
+	end
+
+	local self = setmetatable({}, AIHandler)
+	self.Model = model
+
+	self.Humanoid = model:WaitForChild("Humanoid", 5)
+	self.HRP = model:WaitForChild("HumanoidRootPart", 5)
+	self.Config = model:FindFirstChild("Config")
+
+	if not self.Humanoid or not self.HRP then
+		warn("[AIHandler] Missing Humanoid or HumanoidRootPart in model:", model.Name)
+		return nil
+	end
+
+	-- Basic setup
+	self.MinJumpHeight = (self.Config and self.Config:FindFirstChild("MinJumpHeight") and self.Config.MinJumpHeight.Value) or DEFAULT_MIN_JUMP_HEIGHT
+	self.SpawnPos = self.HRP.Position
+	self.IsDead = false
+	self.LastPos = nil
+	self.StuckTimer = 0
+	self.LastAttack = 0
+	self.Target = nil
+	self.LastGapCheck = 0
+
+	-- Humanoid settings
+	self.Humanoid.WalkSpeed = DEFAULT_WALKSPEED
+	self.Humanoid.JumpPower = 65
+	self.Humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+
+	self.HRP.Anchored = false
+	self.HRP:SetNetworkOwner(nil)
+
+	-- Animation and sound setup
+	self.Animations = {}
+	self.Sounds = {}
+	local animFolder = self.Model:FindFirstChild("Anims")
+	if animFolder then
+		self.Animator = self.Humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator")
+		self.Animator.Parent = self.Humanoid
+
+		for _, asset in pairs(animFolder:GetChildren()) do
+			if asset:IsA("Animation") then
+				self.Animations[asset.Name] = self.Animator:LoadAnimation(asset)
+			elseif asset:IsA("Sound") then
+				self.Sounds[asset.Name] = asset
+			end
+		end
+	end
+
+	-- Play animation by name (ensures others stop)
+	function self:SetAnimation(animName)
+		for name, anim in pairs(self.Animations) do
+			if anim.IsPlaying and name ~= animName then
+				anim:Stop()
+			end
+		end
+		if self.Animations[animName] and not self.Animations[animName].IsPlaying then
+			self.Animations[animName]:Play()
+		end
+	end
+
+	self:SetAnimation("IdleAnim")
+
+	return self
+end
+
+-- Gets a random point around the spawn for wandering
+function AIHandler:GetRandomPoint()
+	for i = 1, 10 do
+		local angle = math.rad(math.random(0, 360))
+		local radius = math.random(10, WANDER_RADIUS)
+		local offset = Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+		local targetPos = self.SpawnPos + offset
+
+		local ray = Workspace:Raycast(targetPos + Vector3.new(0, 50, 0), Vector3.new(0, -150, 0))
+		if ray and ray.Position then
+			local heightDiff = math.abs(ray.Position.Y - self.SpawnPos.Y)
+			if heightDiff < 12 then
+				return ray.Position + Vector3.new(0, 2, 0)
+			end
+		end
+	end
+	return self.SpawnPos
+end
+
+-- Makes the AI wander when no target is found
+function AIHandler:Wander()
+	self:SetAnimation("ForwardAnim")
+	if self.Sounds.Walk and not self.Sounds.Walk.IsPlaying then
+		self.Sounds.Walk:Play()
+	end
+
+	local destination = self:GetRandomPoint()
+	local path = PathfindingService:CreatePath({
+		AgentHeight = self.Humanoid.HipHeight + 2,
+		AgentRadius = 1.5,
+		AgentCanJump = true,
+		WaypointSpacing = 4
+	})
+	path:ComputeAsync(self.HRP.Position, destination)
+
+	if path.Status == Enum.PathStatus.Success then
+		for _, wp in ipairs(path:GetWaypoints()) do
+			if self.IsDead or self.Target then return end
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				self.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+			end
+			self.Humanoid:MoveTo(wp.Position)
+			local start = tick()
+			while tick() - start < 2 do
+				if self.IsDead or self.Target then return end
+				if getDistance(self.HRP, wp.Position) < 3 then break end
+				task.wait(0.05)
+			end
+		end
+	else
+		-- Move forward if path fails
+		self.Humanoid:MoveTo(self.HRP.Position + self.HRP.CFrame.LookVector * 6)
+	end
+
+	self:SetAnimation("IdleAnim")
+	if self.Sounds.Walk and self.Sounds.Walk.IsPlaying then
+		self.Sounds.Walk:Stop()
+	end
+end
+
+-- Checks if the AI is stuck and forces a jump if needed
+function AIHandler:CheckStuck()
+	if not self.LastPos then
+		self.LastPos = self.HRP.Position
+		self.StuckTimer = 0
+	else
+		local moved = (self.HRP.Position - self.LastPos).Magnitude
+		if moved < 1 then
+			self.StuckTimer += RunService.Heartbeat:Wait()
+		else
+			self.StuckTimer = 0
+			self.LastPos = self.HRP.Position
+		end
+
+		if self.StuckTimer >= STUCK_TIMEOUT then
+			self.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+			self.StuckTimer = 0
+		end
+	end
+end
+
+-- Detects obstacles in front and jumps if necessary
+function AIHandler:CheckObstacle()
+	local rayOrigin = self.HRP.Position + Vector3.new(0, 2, 0)
+	local rayDirection = self.HRP.CFrame.LookVector * 1.2
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {self.Model}
+
+	local result = Workspace:Raycast(rayOrigin, rayDirection, params)
+
+	if result then
+		local obstacleTopY = result.Position.Y
+		local aiBaseY = self.HRP.Position.Y
+		local height = obstacleTopY - aiBaseY
+		local upRay = Workspace:Raycast(result.Position, Vector3.new(0, JUMP_HEIGHT_LIMIT, 0), params)
+		if not upRay and height >= self.MinJumpHeight then
+			self.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end
+end
+
+-- Checks if there's a gap in front to prevent falling off
+function AIHandler:CheckGap()
+	if tick() - self.LastGapCheck < 0.5 then return end
+	self.LastGapCheck = tick()
+
+	local frontOrigin = self.HRP.Position + self.HRP.CFrame.LookVector * GAP_CHECK_DISTANCE
+	local downDirection = Vector3.new(0, -GAP_FALL_DEPTH, 0)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {self.Model}
+
+	local hit = Workspace:Raycast(frontOrigin, downDirection, params)
+	if not hit then
+		self.Target = nil
+		self.LastPos = self.HRP.Position
+
+		-- Rotate away from the gap
+		local randomAngle = math.rad(math.random(90, 270))
+		local currentCFrame = self.HRP.CFrame
+		local goalCFrame = currentCFrame * CFrame.Angles(0, randomAngle, 0)
+
+		task.spawn(function()
+			local totalTime = 0.3
+			local elapsed = 0
+			while elapsed < totalTime do
+				local alpha = elapsed / totalTime
+				self.HRP.CFrame = currentCFrame:Lerp(goalCFrame, alpha)
+				elapsed += RunService.Heartbeat:Wait()
+			end
+			self.HRP.CFrame = goalCFrame
+		end)
+	end
+end
+
+-- Finds the closest visible player within range
+function AIHandler:FindClosestPlayer()
+	local closest, closestDist = nil, DETECTION_RADIUS
+	for _, player in pairs(Players:GetPlayers()) do
+		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character:FindFirstChild("Humanoid") then
+			if not CollectionService:HasTag(player.Character, "AI") then
+				local dist = getDistance(self.HRP, player.Character.HumanoidRootPart)
+				if dist < closestDist then
+					local params = RaycastParams.new()
+					params.FilterType = Enum.RaycastFilterType.Exclude
+					params.FilterDescendantsInstances = {self.Model}
+					local result = Workspace:Raycast(self.HRP.Position, (player.Character.HumanoidRootPart.Position - self.HRP.Position), params)
+					if not result or result.Instance:IsDescendantOf(player.Character) then
+						closest = player
+						closestDist = dist
+					end
+				end
+			end
+		end
+	end
+	return closest
+end
+
+-- Handles chasing and attacking the target
+function AIHandler:ChaseAndAttack(targetPlayer)
+	local targetChar = targetPlayer.Character
+	if not targetChar or not targetChar:FindFirstChild("HumanoidRootPart") then return end
+	local targetHum = targetChar:FindFirstChild("Humanoid")
+
+	local dist = getDistance(self.HRP, targetChar.HumanoidRootPart)
+	if dist > ATTACK_RANGE then
+		self.Humanoid:MoveTo(targetChar.HumanoidRootPart.Position)
+		self:SetAnimation("ForwardAnim")
+		if self.Sounds.Walk and not self.Sounds.Walk.IsPlaying then
+			self.Sounds.Walk:Play()
+		end
+	else
+		--  attack if cooldown passed
+		if tick() - self.LastAttack < ATTACK_COOLDOWN then return end
+		self:SetAnimation("IdleAnim")
+		if self.Sounds.Walk and self.Sounds.Walk.IsPlaying then
+			self.Sounds.Walk:Stop()
+		end
+		
+		if self.Animations.Swing_1 then
+			self.Animations.Swing_1:Play()
+		end
+		if self.Sounds.Attack then
+			self.Sounds.Attack:Play()
+		end
+
+		self.LastAttack = tick()
+		if targetHum and targetHum.Health > 0 then
+			targetHum:TakeDamage(ATTACK_DAMAGE)
+		end
+	end
+end
+
+-- Main AI loop
+function AIHandler:Run()
+	if not self.Humanoid or not self.Humanoid.Parent then
+		self.Humanoid = self.Model:WaitForChild("Humanoid", 5)
+		if not self.Humanoid then
+			warn("[AIHandler] Did not find Humanoid in:", self.Model.Name)
+			return
+		end
+	end
+
+	-- Handle death and ragdoll
+	self.Humanoid.Died:Connect(function()
+		self.IsDead = true
+		task.delay(0.3, function()
+			if self.Model and self.Model.Parent then
+				RagdollModule.SetRagdoll(self.Model, true, false, 0)
+				task.delay(3, function()
+					if self.Model and self.Model.Parent then
+						self.Model:Destroy()
+					end
+				end)
+			end
+		end)
+	end)
+
+	-- Core behavior loop
+	task.spawn(function()
+		while not self.IsDead do
+			pcall(function()
+				self:CheckStuck()
+				self:CheckGap()
+
+				local nearest = self:FindClosestPlayer()
+				if nearest then
+					self.Target = nearest
+					self:ChaseAndAttack(self.Target)
+				else
+					self.Target = nil
+					self:WanderAsync()
+				end
+
+				self:CheckObstacle()
+			end)
+
+			task.wait(PATH_UPDATE_INTERVAL)
+		end
+	end)
+end
+
+return AIHandler
